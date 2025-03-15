@@ -1,0 +1,759 @@
+```{r}
+# Load necessary libraries
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(summarytools)
+library(tidyverse)
+library(scales)
+library(gridExtra)
+library(reshape2)
+library(caret)
+library(pROC)
+library(doParallel)  # For parallel processing
+library(smotefamily)  # For SMOTE
+
+```
+
+````{r}
+# Read the CSV file
+data <- read_csv("C:\\Users\\Asus\\Downloads\\archive (22)\\diabetes_binary_health_indicators_BRFSS2015.csv")
+
+str(data)#Structure of the Data
+```
+
+```{r}
+summary(data)#Statistical Summary of the Data
+```
+```{r}
+# 1. Checking Missing Values
+
+# Summarize the missing values in each column
+missing_data <- data %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  pivot_longer(cols = everything(), names_to = "Column", values_to = "MissingCount") %>%
+  filter(MissingCount > 0)
+
+if (nrow(missing_data) > 0) {
+  print("Columns with missing data:")
+  print(missing_data)
+} else {
+  print("No missing data found.")
+}
+```
+```{r}
+# 2. Outlier Detection 
+
+# using boxplots for numeric columns to visually detect outliers
+numeric_columns <- data %>%
+  select_if(is.numeric)
+
+# Generate boxplots for numeric columns to visualize outliers
+boxplot_data <- pivot_longer(numeric_columns, cols = everything(), names_to = "Variable", values_to = "Value")
+ggplot(boxplot_data, aes(x = Variable, y = Value)) +
+  geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 2) +
+  coord_flip() +  # Flip the coordinates to make it easier to read
+  theme_minimal() +
+  labs(title = "Outlier Detection using Boxplots", y = "Values", x = "Variables")
+
+# You can inspect the boxplots and identify outliers by their red points.
+```
+However we see a few outliers here, we dont exclude them or impute them as all of the data points are actual possible values and can help towards building a robust model if the feature is selected.
+
+```{r}
+# Check the data types of each column
+data_types <- sapply(data, class)
+
+# Print the data types in a clear format
+print("Data types of each column:")
+print(data_types)
+
+```
+
+
+```{r}
+
+# Function to perform consistency checks on all columns
+consistency_check <- function(data) {
+  # Initialize a list to store the results of the checks
+  check_results <- list()
+
+  # Iterate through all columns in the dataset
+  for (colname in colnames(data)) {
+    column <- data[[colname]]  # Extract the column
+    
+    # Check for numeric columns
+    if (is.numeric(column)) {
+      # Define custom numeric range check (adjust as necessary)
+      min_val <- min(column, na.rm = TRUE)
+      max_val <- max(column, na.rm = TRUE)
+      
+      # Add a custom rule for specific numeric columns if necessary, for example, 'Age'
+      if (colname == "Age") {
+        invalid_rows <- data %>% filter(Age < 0 | Age > 100)  # Age out of range
+        if (nrow(invalid_rows) > 0) {
+          check_results[[colname]] <- paste("Invalid values in", colname, "- Out of range (0-100)")
+        } else {
+          check_results[[colname]] <- paste(colname, "is consistent (within range 0-100).")
+        }
+      } else {
+        # General numeric range check
+        check_results[[colname]] <- paste(colname, "has values in range", min_val, "to", max_val)
+      }
+    
+    # Check for binary columns (only 2 unique values)
+    } else if (length(unique(na.omit(column))) == 2) {
+      unique_vals <- unique(column)
+      check_results[[colname]] <- paste(colname, "is binary with values:", paste(unique_vals, collapse = ", "))
+    
+    # Check for categorical (factor or character) columns
+    } else if (is.factor(column) || is.character(column)) {
+      unique_vals <- unique(column)
+      if (length(unique_vals) > 10) {
+        unique_vals <- unique_vals[1:10]  # Limit display for long categories
+        check_results[[colname]] <- paste(colname, "is categorical with more than 10 unique values (showing first 10):", paste(unique_vals, collapse = ", "))
+      } else {
+        check_results[[colname]] <- paste(colname, "is categorical with values:", paste(unique_vals, collapse = ", "))
+      }
+    }
+  }
+  
+  return(check_results)
+}
+
+# Run consistency check on the dataset
+results <- consistency_check(data)
+
+# Print results
+for (col in names(results)) {
+  print(results[[col]])
+}
+
+
+```
+As seen all of the features are in normal consistent ranges and a few of the features are encoded so that they can be represented numerically, which is necessary for many predictive machine learning models
+
+
+```{r}
+
+data_cleaned <- data # As the data is clean and ready to use for further analysis
+
+# Function to identify binary features
+identify_binary_features <- function(dataframe) {
+  binary_features <- sapply(dataframe, function(col) length(unique(na.omit(col))) == 2)
+  names(binary_features[binary_features])
+}
+
+# Identify binary features, excluding the target variable
+binary_features <- identify_binary_features(data_cleaned)
+binary_features <- setdiff(binary_features, 'Diabetes_binary')  # Ensure the target variable is not included
+
+# Function to plot proportions for binary features
+plot_binary_proportions <- function(dataframe, features, target_variable) {
+  for (feature in features) {
+    proportions <- dataframe %>%
+      group_by(!!sym(feature)) %>%
+      count(!!sym(target_variable)) %>%
+      mutate(prop = n / sum(n)) %>%
+      ungroup() %>%
+      mutate(!!sym(target_variable) := fct_rev(as.factor(!!sym(target_variable)))) # Reverse factor levels
+    
+    # Plot with updated fill to use factors and reverse order
+    plot <- ggplot(proportions, aes(x = !!sym(feature), y = prop, fill = as.factor(!!sym(target_variable)))) +
+      geom_bar(stat = 'identity', position = 'fill', color = "black") +
+      scale_y_continuous(labels = percent) +
+      labs(y = 'Proportion', x = feature, title = paste("Proportion of", target_variable, "by", feature)) +
+      theme_minimal() +
+      theme(legend.position = 'right') +
+      scale_fill_manual(values = c("salmon", "skyblue")) +  # Custom colors for factors
+      guides(fill = guide_legend(title = target_variable)) +
+      theme(plot.title = element_text(hjust = 0.5))  # Centering the title
+    
+    print(plot)  # Explicitly print each plot
+  }
+}
+
+# Convert 'Diabetes_binary' to factor if it's not already
+data_cleaned$Diabetes_binary <- as.factor(data_cleaned$Diabetes_binary)
+
+# Run the plotting function
+plot_binary_proportions(data_cleaned, binary_features, 'Diabetes_binary')
+
+```
+
+
+
+```{r}
+
+
+# Function to identify binary features
+identify_binary_features <- function(dataframe) {
+  binary_features <- sapply(dataframe, function(col) length(unique(na.omit(col))) == 2)
+  names(binary_features[binary_features])
+}
+
+# Identify binary features, excluding the target variable
+binary_features <- identify_binary_features(data_cleaned)
+binary_features <- setdiff(binary_features, 'Diabetes_binary')  # Ensure the target variable is not included
+
+# Initialize a list to store discrepancy percentages
+discrepancy_percentages <- list()
+
+# Calculate the discrepancy for each binary feature
+for (feature in binary_features) {
+  # Create a contingency table of the feature against the diabetes binary outcome
+  contingency_table <- table(data_cleaned[[feature]], data_cleaned[['Diabetes_binary']])
+  
+  # Calculate the difference in proportions of Diabetes_binary = 1 between the two categories of the feature
+  if (nrow(contingency_table) == 2) {  # Ensure there are two categories
+    discrepancy <- abs(prop.table(contingency_table, 1)[1, 2] - prop.table(contingency_table, 1)[2, 2])
+    discrepancy_percentages[[feature]] <- discrepancy * 100  # Convert to percentage
+  }
+}
+
+# Print the discrepancies as percentages
+for (feature in names(discrepancy_percentages)) {
+  cat(sprintf('Discrepancy in %s: %.2f%%\n', feature, discrepancy_percentages[[feature]]))
+}
+
+```
+```{r}
+
+
+# Function to identify binary features
+identify_binary_features <- function(dataframe) {
+  binary_features <- sapply(dataframe, function(col) length(unique(na.omit(col))) == 2)
+  names(binary_features[binary_features])
+}
+
+# Identify binary features, excluding the target variable 'Diabetes_binary'
+binary_features <- identify_binary_features(data_cleaned)
+binary_features <- setdiff(binary_features, 'Diabetes_binary')  # Ensure the target variable is not included
+
+# Initialize a list to store the p-values
+p_values <- list()
+
+# Perform association (chi-square) test for each binary feature
+for (feature in binary_features) {
+  # Create a contingency table of the feature against Diabetes_binary
+  contingency_table <- table(data_cleaned[[feature]], data_cleaned[['Diabetes_binary']])
+  
+  # Perform the chi-square test
+  chi_sq_result <- chisq.test(contingency_table)
+  
+  # Store the p-value in the p_values list
+  p_values[[feature]] <- chi_sq_result$p.value
+  
+  # Print the feature name and the p-value
+  cat(sprintf('Chi-squared test p-value for %s: %.5f\n', feature, p_values[[feature]]))
+}
+
+
+```
+```{r}
+# Perform Fisher's exact test for each binary feature
+for (feature in binary_features) {
+  # Create a contingency table of the feature against Diabetes_binary
+  contingency_table <- table(data_cleaned[[feature]], data_cleaned[['Diabetes_binary']])
+  
+  # Perform the Fisher's exact test
+  fisher_result <- fisher.test(contingency_table)
+  
+  # Extract and print the p-value
+  p_value <- fisher_result$p.value
+  cat(sprintf('Fisher\'s Exact test p-value for %s: %.5f\n', feature, p_value))
+}
+
+```
+
+
+```{r}
+
+# Identify non-binary features (more than 2 unique values and not 'Diabetes_binary')
+non_binary_features <- names(data_cleaned)[sapply(data_cleaned, function(col) length(unique(col)) > 2 & !is.factor(col))]
+non_binary_features <- setdiff(non_binary_features, 'Diabetes_binary')
+
+# Convert 'Diabetes_binary' to factor if it's not already
+data_cleaned$Diabetes_binary <- as.factor(data_cleaned$Diabetes_binary)
+
+# Number of plots
+num_plots <- length(non_binary_features)
+cols <- 2  # Number of columns in subplot grid
+rows <- ceiling(num_plots / cols)  # Determine the number of rows
+
+# Plot each non-binary feature in a box plot
+par(mfrow = c(rows, cols))  # Set up the plot layout
+
+for (feature in non_binary_features) {
+  ggplot(data_cleaned, aes(x = Diabetes_binary, y = .data[[feature]])) +
+    geom_boxplot() +
+    labs(title = paste(feature, "by Diabetes Status"),
+         x = "Diabetes_binary",
+         y = feature) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))  # Centering the title
+}
+
+```
+
+```{r}
+
+
+# Identify non-binary features (more than 2 unique values and not 'Diabetes_binary')
+non_binary_features <- names(data_cleaned)[sapply(data_cleaned, function(col) length(unique(col)) > 2 & !is.factor(col))]
+non_binary_features <- setdiff(non_binary_features, 'Diabetes_binary')
+
+# Convert 'Diabetes_binary' to factor if it's not already
+data_cleaned$Diabetes_binary <- as.factor(data_cleaned$Diabetes_binary)
+
+# Save each plot to a file and display it
+for (feature in non_binary_features) {
+  plot <- ggplot(data_cleaned, aes(x = Diabetes_binary, y = .data[[feature]])) +
+    geom_boxplot() +
+    labs(title = paste(feature, "by Diabetes Status"),
+         x = "Diabetes_binary",
+         y = feature) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))  # Centering the title
+  
+
+  # Print each plot to ensure it is displayed
+  print(plot)
+}
+
+```
+
+
+```{r}
+
+# Identify non-binary features (more than 2 unique values and not 'Diabetes_binary')
+non_binary_features <- names(data_cleaned)[sapply(data_cleaned, function(col) length(unique(col)) > 2 & !is.factor(col))]
+non_binary_features <- setdiff(non_binary_features, 'Diabetes_binary')
+
+# Convert 'Diabetes_binary' to factor if it's not already
+data_cleaned$Diabetes_binary <- as.factor(data_cleaned$Diabetes_binary)
+
+# Initialize a list to store discrepancies
+discrepancy_list <- list()
+
+# Calculate discrepancies for each non-binary feature
+for (feature in non_binary_features) {
+  # Calculate the median for Diabetes_binary = 0 and Diabetes_binary = 1
+  median_0 <- median(data_cleaned %>% filter(Diabetes_binary == 0) %>% pull(.data[[feature]]), na.rm = TRUE)
+  median_1 <- median(data_cleaned %>% filter(Diabetes_binary == 1) %>% pull(.data[[feature]]), na.rm = TRUE)
+  
+  # Calculate the absolute difference in medians
+  discrepancy <- abs(median_1 - median_0)
+  
+  # Store the discrepancy
+  discrepancy_list[[feature]] <- discrepancy
+}
+
+# Print the discrepancies
+for (feature in names(discrepancy_list)) {
+  cat(sprintf('Discrepancy in %s: %.2f\n', feature, discrepancy_list[[feature]]))
+}
+
+```
+```{r}
+
+
+
+# Identify non-binary features (more than 2 unique values and not 'Diabetes_binary')
+non_binary_features <- names(data_cleaned)[sapply(data_cleaned, function(col) length(unique(col)) > 2)]
+non_binary_features <- setdiff(non_binary_features, 'Diabetes_binary')
+
+# Initialize a named vector to store discrepancies
+discrepancy_values <- numeric(length(non_binary_features))
+names(discrepancy_values) <- non_binary_features
+
+# Calculate the median discrepancies for each non-binary feature
+for (feature in non_binary_features) {
+  medians <- data_cleaned %>% 
+    group_by(Diabetes_binary) %>% 
+    summarise(median_value = median(.data[[feature]], na.rm = TRUE))
+  
+  if (nrow(medians) == 2) {  # Ensure there are two groups to compare
+    discrepancy <- abs(medians$median_value[1] - medians$median_value[2])
+    discrepancy_values[feature] <- discrepancy
+  }
+}
+
+# Remove features with NA discrepancies (if any)
+discrepancy_values <- na.omit(discrepancy_values)
+
+# Sort discrepancies to identify the most significant ones
+sorted_discrepancies <- sort(discrepancy_values, decreasing = TRUE)
+
+# Plotting discrepancies
+features <- names(sorted_discrepancies)
+discrepancies <- sorted_discrepancies
+
+# Create a horizontal bar plot
+ggplot(data.frame(Feature = features, Discrepancy = discrepancies), aes(x = reorder(Feature, Discrepancy), y = Discrepancy)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(x = "Non-Binary Feature", y = "Absolute Median Discrepancy", title = "Discrepancy in Median Values by Diabetes Status") +
+  theme_minimal() +
+  coord_flip()  # Flip coordinates for a horizontal bar plot
+
+```
+
+
+
+```{r}
+
+# Compute the correlation matrix for all selected columns
+correlation_matrix <- data %>%
+  cor(use = "complete.obs")      # Use 'complete.obs' to exclude rows with missing values
+
+# Display the correlation matrix
+print(correlation_matrix)
+
+```
+
+
+```{r}
+
+# Convert the correlation matrix into a long format for ggplot2
+correlation_melted <- melt(correlation_matrix)
+
+# Generate a basic heatmap
+ggplot(correlation_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +  # Basic tiles with white grid lines
+  scale_fill_gradient(low = "yellow", high = "blue", name = "Correlation") +  # Basic color gradient from blue to red
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1, size = 10),  # Adjusting text angle and size for x-axis
+    axis.text.y = element_text(size = 10),  # Adjusting text size for y-axis
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Centering and styling the title
+    panel.grid.major = element_blank(),  # Removing grid lines
+    panel.grid.minor = element_blank()   # Removing minor grid lines
+  ) +
+  labs(title = "Basic Correlation Heatmap between Features and Diabetes Status", x = "", y = "") +
+  coord_fixed()  # Fixed aspect ratio
+
+```
+
+
+
+```{r}
+# Feature Selection Based on EXPLORATORY DATA ANALYSIS
+# Selecting the features and the target variable
+features <- c('PhysHlth', 'GenHlth', 'Income', 'Age', 'BMI', 'HighBP', 'HighChol',
+              'CholCheck', 'Stroke', 'HeartDiseaseorAttack', 'PhysActivity',
+              'DiffWalk', 'HvyAlcoholConsump')
+target <- 'Diabetes_binary'
+columns <- c(features, target)
+```
+The following features are selected based on the above performed Exploratory Data Analysis 
+Features: 'PhysHlth', 'GenHlth', 'Income', 'Age', 'BMI', 'HighBP', 'HighChol',
+              'CholCheck', 'Stroke', 'HeartDiseaseorAttack', 'PhysActivity',
+              'DiffWalk', 'HvyAlcoholConsump'
+
+
+```{r}
+# Feature Scaling and Handling class imbalances  
+
+
+# Selecting the features decided from EDA and the target variable
+features <- c('PhysHlth', 'GenHlth', 'Income', 'Age', 'BMI', 'HighBP', 'HighChol',
+              'CholCheck', 'Stroke', 'HeartDiseaseorAttack', 'PhysActivity',
+              'DiffWalk', 'HvyAlcoholConsump')
+target <- 'Diabetes_binary'
+
+# Prepare the data: Subset the dataframe to include only the selected features and the target
+data_model <- data %>% 
+  select(all_of(c(features, target))) %>%
+  drop_na()  # Remove rows with missing values
+
+# Convert the target variable to a factor and rename levels to valid names
+data_model$Diabetes_binary <- as.factor(data_model$Diabetes_binary)
+levels(data_model$Diabetes_binary) <- c("No", "Yes")  # Rename levels to "No" and "Yes"
+
+# Split the data into training and testing sets (80-20 split)
+set.seed(42)
+train_index <- createDataPartition(data_model$Diabetes_binary, p = 0.8, list = FALSE)
+train_data <- data_model[train_index, ]
+test_data <- data_model[-train_index, ]
+
+# Feature Scaling (Normalization/Standardization)
+preProc <- preProcess(train_data[, features], method = c("center", "scale"))
+train_data[, features] <- predict(preProc, train_data[, features])
+test_data[, features] <- predict(preProc, test_data[, features])
+
+# Handling class imbalance using SMOTE from the smotefamily package
+set.seed(42)
+train_data_smote <- SMOTE(train_data[, features], train_data$Diabetes_binary, K = 5)  # K is the number of neighbors
+
+# Checking the new class distribution after SMOTE
+table(train_data_smote$data$class)
+
+# Rename the 'class' column to 'Diabetes_binary' in the SMOTE dataset
+train_data_smote$data$Diabetes_binary <- as.factor(train_data_smote$data$class)  # Rename 'class' to 'Diabetes_binary'
+train_data_smote$data <- train_data_smote$data %>% select(-class)  # Remove the 'class' column
+
+# Display the distribution after SMOTE
+table(train_data_smote$data$Diabetes_binary)
+
+```
+```{r}
+# Load necessary libraries
+library(caret)
+library(pROC)
+
+# Initialize control for cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train a Logistic Regression model using SMOTE-balanced data
+logistic_model <- train(Diabetes_binary ~ ., 
+                        data = train_data_smote$data,  # Use the SMOTE-balanced data
+                        method = "glm", 
+                        family = "binomial", 
+                        trControl = control, 
+                        metric = "ROC")
+
+# Predict on the original test set
+lr_predictions <- predict(logistic_model, test_data)
+lr_prob_predictions <- predict(logistic_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_lr <- confusionMatrix(lr_predictions, test_data$Diabetes_binary)
+roc_obj_lr <- roc(test_data$Diabetes_binary, lr_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("Logistic Regression Model Performance (After SMOTE Training):\n")
+print(conf_matrix_lr)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_lr)))
+
+# Plot the ROC curve
+plot(roc_obj_lr, main = "Logistic Regression ROC Curve (After SMOTE Training)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+```
+
+
+
+
+```{r}
+# Load necessary libraries
+library(caret)
+library(pROC)
+
+# Initialize control for cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train a Random Forest model using SMOTE-balanced data
+rf_model <- train(Diabetes_binary ~ ., 
+                  data = train_data_smote$data,  # Use the SMOTE-balanced data
+                  method = "rf", 
+                  trControl = control, 
+                  metric = "ROC")
+
+# Predict on the original test set
+rf_predictions <- predict(rf_model, test_data)
+rf_prob_predictions <- predict(rf_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_rf <- confusionMatrix(rf_predictions, test_data$Diabetes_binary)
+roc_obj_rf <- roc(test_data$Diabetes_binary, rf_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("Random Forest Model Performance (After SMOTE Training):\n")
+print(conf_matrix_rf)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_rf)))
+
+# Plot the ROC curve
+plot(roc_obj_rf, main = "Random Forest ROC Curve (After SMOTE Training)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+```
+
+
+
+
+```{r}
+# Load necessary libraries
+library(caret)
+library(pROC)
+
+# Initialize control for cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train a Decision Tree model using SMOTE-balanced data
+dt_model <- train(Diabetes_binary ~ ., 
+                  data = train_data_smote$data,  # Use the SMOTE-balanced data
+                  method = "rpart",  # Decision tree method
+                  trControl = control, 
+                  metric = "ROC")
+
+# Predict on the original test set
+dt_predictions <- predict(dt_model, test_data)
+dt_prob_predictions <- predict(dt_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_dt <- confusionMatrix(dt_predictions, test_data$Diabetes_binary)
+roc_obj_dt <- roc(test_data$Diabetes_binary, dt_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("Decision Tree Model Performance (After SMOTE Training):\n")
+print(conf_matrix_dt)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_dt)))
+
+# Plot the ROC curve
+plot(roc_obj_dt, main = "Decision Tree ROC Curve (After SMOTE Training)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+``` 
+
+
+```{r}
+# Load necessary libraries
+library(caret)
+library(pROC)
+
+# Initialize control for cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train a Neural Network model using SMOTE-balanced data
+nn_model <- train(Diabetes_binary ~ ., 
+                  data = train_data_smote$data,  # Use the SMOTE-balanced data
+                  method = "nnet",  # Neural network method
+                  trControl = control, 
+                  metric = "ROC", 
+                  linout = FALSE,  # For classification
+                  trace = FALSE,   # Suppress detailed output
+                  tuneLength = 5)  # Adjust tune length to explore multiple sizes
+
+# Predict on the original test set
+nn_predictions <- predict(nn_model, test_data)
+nn_prob_predictions <- predict(nn_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_nn <- confusionMatrix(nn_predictions, test_data$Diabetes_binary)
+roc_obj_nn <- roc(test_data$Diabetes_binary, nn_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("Neural Network Model Performance (After SMOTE Training):\n")
+print(conf_matrix_nn)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_nn)))
+
+# Plot the ROC curve
+plot(roc_obj_nn, main = "Neural Network ROC Curve (After SMOTE Training)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+```
+
+
+```{r}
+
+# Downsample the training set (for faster model testing) cause facing one of the limitations of computational resources
+set.seed(42)
+train_data_sample1 <- train_data_smote$data %>%
+  sample_n(5000)  # Taking a smaller sample of 1,000 for testing
+```
+
+```{r}
+# Check the class distribution in the downsampled training data
+table(train_data_sample1$Diabetes_binary)
+
+```
+
+```{r}
+# Set up parallel processing (if available on your machine)
+cl <- makeCluster(detectCores() - 1)  # Use all cores minus 1
+registerDoParallel(cl)
+
+# Initialize control for cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train a KNN model using SMOTE-balanced data with fewer folds and smaller tuneLength
+set.seed(42)  # Ensure reproducibility
+knn_model <- train(Diabetes_binary ~ ., 
+                   data = train_data_sample1,  # Use the SMOTE-balanced downsampleddata
+                   method = "knn",  # KNN method
+                   trControl = control, 
+                   metric = "ROC", 
+                   tuneLength = 5)  # Reduced tuning length to 5 values
+
+# Predict on the original test set
+knn_predictions <- predict(knn_model, test_data)
+knn_prob_predictions <- predict(knn_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_knn <- confusionMatrix(knn_predictions, test_data$Diabetes_binary)
+roc_obj_knn <- roc(test_data$Diabetes_binary, knn_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("KNN Model Performance (After Downsampling):\n")
+print(conf_matrix_knn)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_knn)))
+
+# Plot the ROC curve
+plot(roc_obj_knn, main = "KNN ROC Curve (After Downsampling)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+# Stop the parallel cluster after training
+stopCluster(cl)
+```
+
+
+
+```{r}
+# Set up parallel processing (optional but recommended if you have multiple cores)
+cl <- makeCluster(detectCores() - 1)  # Use all but one core
+registerDoParallel(cl)
+
+# Initialize control for 5-fold cross-validation
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train an SVM model using the downsampled data with tuning length of 5
+set.seed(42)  # Ensure reproducibility
+svm_model <- train(Diabetes_binary ~ ., 
+                   data = train_data_sample1,  # Use the downsampled data
+                   method = "svmRadial",  # Radial Basis Function kernel for SVM
+                   trControl = control, 
+                   metric = "ROC", 
+                   tuneLength = 5)  # Explore 5 different hyperparameter combinations
+
+# Predict on the original test set
+svm_predictions <- predict(svm_model, test_data)
+svm_prob_predictions <- predict(svm_model, test_data, type = "prob")[,2]
+
+# Evaluate the model on the original test set
+conf_matrix_svm <- confusionMatrix(svm_predictions, test_data$Diabetes_binary)
+roc_obj_svm <- roc(test_data$Diabetes_binary, svm_prob_predictions, levels = rev(levels(test_data$Diabetes_binary)))
+
+# Print performance metrics
+cat("SVM Model Performance (After Downsampling):\n")
+print(conf_matrix_svm)
+cat(sprintf("AUC: %.2f\n", auc(roc_obj_svm)))
+
+# Plot the ROC curve
+plot(roc_obj_svm, main = "SVM ROC Curve (After Downsampling)", col = "blue")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+# Stop the parallel cluster after training
+stopCluster(cl)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
